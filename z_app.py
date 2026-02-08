@@ -1,19 +1,20 @@
 from dotenv import load_dotenv
-from tool_set import find_all_tabs_and_sections, generate_test_report, navigate_to_shiny_app, test_interactive_elements, test_shiny_page
-from shiny_qc_agent import create_shiny_testing_agent
+from tool_set import run_comprehensive_shiny_tests
 
-load_dotenv()  # Load environment variables from .env file
+load_dotenv()
 
-agent = create_shiny_testing_agent()
-test_url = "https://gallery.shinyapps.io/006-tabsets/?_gl=1*16xq47f*_ga*MTE1ODQyMTc1Mi4xNzA5MzQ3MDMx*_ga_2C0WZ1JHG0*czE3NzA1Njc5NDgkbzE4JGcxJHQxNzcwNTY3OTk4JGoxMCRsMCRoMA.."
-result = agent.run(f"""
-    Please test the Shiny app at {test_url}:
-    1. First discover all tabs and navigation elements
-    """)
-print(result)
+# Test the comprehensive test suite
+test_url = "https://gallery.shinyapps.io/006-tabsets/"
+app_name = "006-tabsets"
 
-"""
-2. Test each major tab/section for errors
-    3. Check interactive elements
-    4. Generate a comprehensive test report
-"""
+print("\n" + "="*60)
+print("Starting Comprehensive Shiny App QC Test")
+print("="*60 + "\n")
+
+try:
+    report_path = run_comprehensive_shiny_tests(test_url, app_name)
+    print(f"\n✓ SUCCESS: Report generated at {report_path}")
+except Exception as e:
+    print(f"\n✗ ERROR: {str(e)}")
+    import traceback
+    traceback.print_exc()

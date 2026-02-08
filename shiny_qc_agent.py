@@ -12,7 +12,16 @@ import json
 from datetime import datetime
 from typing import List, Dict, Any
 import time
-from tool_set import find_all_tabs_and_sections, navigate_to_shiny_app, test_interactive_elements, test_shiny_page, generate_test_report
+from tool_set import (
+    navigate_to_shiny_app,
+    find_all_tabs_and_sections,
+    test_tabs_navigation,
+    test_shiny_page,
+    test_sliders,
+    test_radio_buttons,
+    generate_test_report,
+    run_comprehensive_shiny_tests
+)
 
 # Load environment variables
 load_dotenv()
@@ -31,9 +40,12 @@ def create_shiny_testing_agent():
     tools = [
         navigate_to_shiny_app,
         find_all_tabs_and_sections,
+        test_tabs_navigation,
         test_shiny_page,
-        test_interactive_elements,
-        generate_test_report
+        test_sliders,
+        test_radio_buttons,
+        generate_test_report,
+        run_comprehensive_shiny_tests
     ]
     
     agent = ToolCallingAgent(
