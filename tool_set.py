@@ -329,8 +329,11 @@ def _wait_for_tab_settle(
             const outputBusy = !!scope.querySelector(
                 '.shiny-bound-output.shiny-busy, [aria-busy="true"]'
             );
+            const pendingVisiblePlot = [...scope.querySelectorAll('.shiny-bound-output.recalculating')]
+                .filter(visible)
+                .some(el => el.matches('.shiny-plot-output') || /plot|chart|graph/i.test(el.id));
             const appBusy = document.documentElement.classList.contains('shiny-busy') ||
-                document.body.classList.contains('shiny-busy') || outputBusy;
+                document.body.classList.contains('shiny-busy') || outputBusy || pendingVisiblePlot;
 
             // Shiny's progress UI is commonly rendered outside the tab panel.
             // Also recognize the plain-text Computing... indicator used by

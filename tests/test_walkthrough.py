@@ -155,6 +155,35 @@ class WalkthroughTests(unittest.TestCase):
             self.assertTrue(page.locator("#output").evaluate("el => el.classList.contains('recalculating')"))
             browser.close()
 
+    def test_settle_waits_for_visible_recalculating_plot_output(self):
+        markup = """
+        <section id="panel" class="tab-pane active">
+            <div id="plot_out_main" class="shiny-html-output shiny-bound-output recalculating" style="width: 672px"></div>
+        </section>
+        <script>
+          setTimeout(() => {
+            const plot = document.querySelector('#plot_out_main');
+            plot.classList.remove('recalculating');
+            plot.style.height = '400px';
+            plot.innerHTML = '<svg><circle cx="10" cy="10" r="8"></circle></svg>';
+          }, 1200);
+        </script>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(markup)
+            started = time.perf_counter()
+            tool_set._wait_for_tab_settle(page, timeout=5000, panel_id="panel")
+            elapsed = time.perf_counter() - started
+            plot_state = page.locator("#plot_out_main").evaluate(
+                "el => [el.className, el.clientHeight, el.childElementCount]"
+            )
+            self.assertGreaterEqual(elapsed, 2.5)
+            self.assertNotIn("recalculating", plot_state[0])
+            self.assertEqual(plot_state[1:], [400, 1])
+            browser.close()
+
     def test_navigation_failure_generates_report_and_closes_browser(self):
         page = MagicMock()
         page.goto.side_effect = RuntimeError("temporary DNS failure")
