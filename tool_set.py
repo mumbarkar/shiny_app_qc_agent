@@ -34,7 +34,7 @@ def _timeout_setting(name: str, default: int) -> int:
 
 SHINY_LOAD_TIMEOUT = _timeout_setting("SHINY_LOAD_TIMEOUT_MS", 90000)
 SHINY_READY_TIMEOUT = _timeout_setting("SHINY_READY_TIMEOUT_MS", 60000)
-TAB_RENDER_TIMEOUT = _timeout_setting("SHINY_TAB_RENDER_TIMEOUT_MS", 60000)
+TAB_RENDER_TIMEOUT = _timeout_setting("SHINY_TAB_RENDER_TIMEOUT_MS", 90000)
 SCREENSHOT_TIMEOUT = _timeout_setting("SHINY_SCREENSHOT_TIMEOUT_MS", 90000)
 TAB_CLICK_TIMEOUT = _timeout_setting("SHINY_ACTION_TIMEOUT_MS", 15000)
 GLOBAL_RUN_TIMEOUT = _timeout_setting("SHINY_RUN_TIMEOUT_MS", 900000)
@@ -44,11 +44,107 @@ TAB_SELECTOR = '[role="tab"], a[data-toggle="tab"], [data-bs-toggle="tab"]'
 CONTROL_SELECTOR = 'button, input:not([type="hidden"]), select, textarea, [role="button"], [role="checkbox"], [role="radio"]'
 
 
-def _screenshot_timeout_ms(run_started: float) -> int:
-    remaining_ms = GLOBAL_RUN_TIMEOUT - int((time.perf_counter() - run_started) * 1000)
+SHINY_CONNECTION_MONITOR = """(() => {
+    if (window.__qcShinyConnection) return;
+    const state = window.__qcShinyConnection = {
+        status: 'unknown',
+        disconnectCount: 0,
+        lastEventAt: performance.now(),
+        jqueryAttached: false
+    };
+    const connected = () => {
+        state.status = 'connected';
+        state.lastEventAt = performance.now();
+    };
+    const disconnected = () => {
+        state.status = 'disconnected';
+        state.disconnectCount += 1;
+        state.lastEventAt = performance.now();
+    };
+    document.addEventListener('shiny:connected', connected, true);
+    document.addEventListener('shiny:disconnected', disconnected, true);
+    const attachJQuery = () => {
+        if (state.jqueryAttached || !window.jQuery) return;
+        window.jQuery(document).on('shiny:connected', connected);
+        window.jQuery(document).on('shiny:disconnected', disconnected);
+        state.jqueryAttached = true;
+    };
+    const jqueryPoll = window.setInterval(() => {
+        attachJQuery();
+        if (state.jqueryAttached) window.clearInterval(jqueryPoll);
+    }, 25);
+    attachJQuery();
+})();"""
+
+
+def _install_shiny_connection_monitor(page: Page) -> None:
+    page.add_init_script(SHINY_CONNECTION_MONITOR)
+
+
+def _wait_for_shiny_connection(page: Page, timeout: int = SHINY_READY_TIMEOUT) -> None:
+    page.wait_for_function(
+        "() => window.__qcShinyConnection?.status === 'connected'",
+        timeout=timeout,
+    )
+    if _shiny_connection_snapshot(page)["disconnected"]:
+        raise RuntimeError("Shiny server disconnected during initial connection")
+
+
+def _shiny_connection_snapshot(page: Page) -> Dict[str, Any]:
+    return page.evaluate(
+        """() => {
+            const state = window.__qcShinyConnection || {};
+            const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ').toLowerCase();
+            return {
+                status: state.status || 'unknown',
+                disconnect_count: state.disconnectCount || 0,
+                disconnected: state.status === 'disconnected' ||
+                    bodyText.includes('disconnected from the server')
+            };
+        }"""
+    )
+
+
+def _capture_tab_screenshot(
+    page: Page,
+    tab_name: str,
+    panel_id: str | None,
+    deadline: float,
+) -> bytes:
+    wait_for_settle = False
+    while True:
+        if wait_for_settle:
+            _wait_for_tab_settle(
+                page,
+                timeout=_remaining_timeout_ms(deadline),
+                panel_id=panel_id,
+            )
+        before = _shiny_connection_snapshot(page)
+        if before["disconnected"]:
+            wait_for_settle = True
+            continue
+
+        screenshot = page.screenshot(
+            type="png",
+            full_page=True,
+            timeout=_remaining_timeout_ms(deadline, timeout_cap=SCREENSHOT_TIMEOUT),
+        )
+        after = _shiny_connection_snapshot(page)
+        if after["disconnected"] or after["disconnect_count"] != before["disconnect_count"]:
+            logger.warning(
+                "Shiny connection changed during screenshot of tab '%s'; waiting and retrying",
+                tab_name,
+            )
+            wait_for_settle = True
+            continue
+        return screenshot
+
+
+def _remaining_timeout_ms(deadline: float, timeout_cap: int | None = None) -> int:
+    remaining_ms = int((deadline - time.perf_counter()) * 1000)
     if remaining_ms <= 0:
-        raise TimeoutError("Global run deadline reached before screenshot capture")
-    return min(SCREENSHOT_TIMEOUT, remaining_ms)
+        raise TimeoutError("Per-tab render deadline reached")
+    return min(timeout_cap, remaining_ms) if timeout_cap is not None else remaining_ms
 
 
 def _visible_tab_descriptors(page: Page, parent_panel: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
@@ -258,15 +354,23 @@ def _wait_for_tab_settle(
                 }
             }
             const progressBusy = visibleProgress || computingText;
+            const connection = window.__qcShinyConnection;
+            const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ').toLowerCase();
+            const disconnected = connection?.status === 'disconnected' ||
+                bodyText.includes('disconnected from the server');
             if (appBusy || progressBusy) {
                 window.__qc_last_busy_seen = performance.now();
             }
 
-            return !appBusy && !progressBusy &&
+            const fontsReady = !document.fonts || document.fonts.status === 'loaded';
+            const visibleImagesReady = [...scope.querySelectorAll('img')]
+                .filter(visible).every(image => image.complete && image.naturalWidth > 0);
+            return !appBusy && !progressBusy && !disconnected && fontsReady && visibleImagesReady &&
                 performance.now() - Math.max(
                     window.__qc_last_panel_mutation || 0,
-                    window.__qc_last_busy_seen || 0
-                ) >= 1200;
+                    window.__qc_last_busy_seen || 0,
+                    connection?.lastEventAt || 0
+                ) >= 1500;
         }""",
         arg=panel_id,
         timeout=timeout,
@@ -984,11 +1088,14 @@ def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
     logger.info(f"App: {app_name} | URL: {url}")
     logger.info(f"{'='*60}\n")
     
+    started_at = datetime.now()
     run_started = time.perf_counter()
     tab_results: Dict[str, Any] = {
         "smoke_test": True,
         "url": url,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": started_at.isoformat(),
+        "start_time": started_at.isoformat(),
+        "end_time": None,
         "tabs_tested": [],
         "errors": [],
         "total_tabs": 0,
@@ -1002,11 +1109,13 @@ def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=False)
             page = browser.new_page()
+            _install_shiny_connection_monitor(page)
             try:
                 navigation_started = time.perf_counter()
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=SHINY_LOAD_TIMEOUT)
                     _wait_for_shiny_content(page)
+                    _wait_for_shiny_connection(page)
                     navigation_succeeded = True
                 except Exception as exc:
                     tab_results["errors"].append(f"Initial navigation/readiness failed: {exc}")
@@ -1017,6 +1126,8 @@ def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
                     logger.info("Initial navigation/readiness elapsed: %.2fs", tab_results["navigation_seconds"])
 
                 if not navigation_succeeded:
+                    tab_results["end_time"] = datetime.now().isoformat()
+                    tab_results["elapsed_seconds"] = round(time.perf_counter() - run_started, 2)
                     report_path = generate_test_report(json.dumps([tab_results]), app_name)
                     logger.error("Walkthrough failed during startup; failure report: %s", report_path)
                     return report_path
@@ -1061,14 +1172,26 @@ def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
                         })
                         return
                     tab_timeout = min(TAB_RENDER_TIMEOUT, remaining_ms)
+                    tab_deadline = min(
+                        tab_started + tab_timeout / 1000,
+                        run_started + GLOBAL_RUN_TIMEOUT / 1000,
+                    )
                     logger.info("Starting tab %d: %s", tab_results["total_tabs"], tab_name)
                     try:
                         for ancestor in ancestors:
                             if not _is_tab_panel_active(page, ancestor):
                                 _activate_tab(page, ancestor)
-                                _wait_for_tab_settle(page, timeout=tab_timeout, panel_id=ancestor.get("panel_id"))
+                                _wait_for_tab_settle(
+                                    page,
+                                    timeout=_remaining_timeout_ms(tab_deadline),
+                                    panel_id=ancestor.get("panel_id"),
+                                )
                         _activate_tab(page, tab)
-                        _wait_for_tab_settle(page, timeout=tab_timeout, panel_id=tab.get("panel_id"))
+                        _wait_for_tab_settle(
+                            page,
+                            timeout=_remaining_timeout_ms(tab_deadline),
+                            panel_id=tab.get("panel_id"),
+                        )
                         tab_results["tabs_tested"].append({
                             "text": tab_name,
                             "key": tab["key"],
@@ -1079,6 +1202,13 @@ def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
                         })
                         logger.info("Tab '%s' settled (%.2fs)", tab_name, time.perf_counter() - tab_started)
                     except Exception as exc:
+                        try:
+                            if _shiny_connection_snapshot(page)["disconnected"]:
+                                exc = RuntimeError(
+                                    "Shiny server disconnected while waiting for the tab to render"
+                                )
+                        except Exception:
+                            pass
                         tab_results["tabs_tested"].append({
                             "text": tab_name,
                             "key": tab["key"],
@@ -1095,13 +1225,18 @@ def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
                     # Screenshot capture is required for a successful smoke-test row,
                     # but a capture failure must not stop the remaining tab walk.
                     try:
-                        screenshot_timeout = _screenshot_timeout_ms(run_started)
-                        screenshot_bytes = page.screenshot(
-                            type="png", full_page=True, timeout=screenshot_timeout
+                        screenshot_started = time.perf_counter()
+                        screenshot_bytes = _capture_tab_screenshot(
+                            page, tab_name, tab.get("panel_id"), tab_deadline
                         )
                         tab_results["tabs_tested"][-1]["screenshot_base64"] = base64.b64encode(
                             screenshot_bytes
                         ).decode("ascii")
+                        logger.info(
+                            "Screenshot captured for tab '%s' (%.2fs)",
+                            tab_name,
+                            time.perf_counter() - screenshot_started,
+                        )
                     except Exception as exc:
                         row = tab_results["tabs_tested"][-1]
                         row["status"] = "screenshot_failed"
@@ -1127,6 +1262,7 @@ def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
                     row.get("status") == "not_run" for row in tab_results["tabs_tested"]
                 ):
                     tab_results["status"] = "failed"
+                tab_results["end_time"] = datetime.now().isoformat()
                 tab_results["elapsed_seconds"] = round(time.perf_counter() - run_started, 2)
 
                 logger.info("Generating report; %d/%d tabs visited", len(tab_results["tabs_tested"]), tab_results["total_tabs"])
@@ -1340,7 +1476,10 @@ def generate_test_report(test_results: str, app_name: str) -> str:
     <p class="meta"><strong>Test date:</strong> {html.escape(str(smoke_results.get('timestamp') or 'Unavailable'))}</p>
     <p class="meta"><strong>Overall status:</strong> <span class="{overall_status_class}">{overall_status.upper()}</span></p>
     <p class="meta"><strong>Tabs:</strong> {len(tabs)} visited of {smoke_results.get('total_tabs', len(tabs))} discovered; <strong>Root tabs:</strong> {smoke_results.get('root_tabs', 0)}</p>
-    <p class="meta"><strong>Elapsed:</strong> {html.escape(str(smoke_results.get('elapsed_seconds', '—')))} s; <strong>Initial navigation:</strong> {html.escape(str(smoke_results.get('navigation_seconds', '—')))} s</p>
+    <p class="meta"><strong>Start Time:</strong> {html.escape(str(smoke_results.get('start_time') or smoke_results.get('timestamp') or 'Unavailable'))}</p>
+    <p class="meta"><strong>End Time:</strong> {html.escape(str(smoke_results.get('end_time') or 'Unavailable'))}</p>
+    <p class="meta"><strong>Total Time for Testing:</strong> {html.escape(str(smoke_results.get('elapsed_seconds', 'Unavailable')))} s</p>
+    <p class="meta"><strong>Initial navigation:</strong> {html.escape(str(smoke_results.get('navigation_seconds', 'Unavailable')))} s</p>
     <h2>Tab Walk Results</h2>
     <table><thead><tr><th>Tab</th><th>Status</th><th>Elapsed (s)</th><th>Details</th></tr></thead><tbody>
 """

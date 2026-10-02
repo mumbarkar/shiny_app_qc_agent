@@ -56,6 +56,9 @@ class WalkthroughTests(unittest.TestCase):
         ), patch.object(tool_set, "_visible_tab_descriptors", side_effect=descriptors), patch.object(
             tool_set, "_activate_tab", side_effect=activate
         ), patch.object(tool_set, "_wait_for_tab_settle", side_effect=wait_for_settle), patch.object(
+            tool_set, "_shiny_connection_snapshot",
+            return_value={"status": "unknown", "disconnect_count": 0, "disconnected": False},
+        ), patch.object(
             tool_set, "_is_tab_panel_active", return_value=False
         ), patch.object(
             tool_set, "_visible_control_inventory", side_effect=AssertionError("must not inspect controls")
@@ -82,17 +85,15 @@ class WalkthroughTests(unittest.TestCase):
         self.assertEqual([call.args for call in page.locator.call_args_list], [("body",)])
         page.wait_for_timeout.assert_not_called()
 
-    def test_screenshot_timeout_is_capped_by_remaining_global_runtime(self):
+    def test_screenshot_timeout_is_capped_by_remaining_tab_runtime(self):
         with patch.object(tool_set, "GLOBAL_RUN_TIMEOUT", 5000), patch.object(
             tool_set, "SCREENSHOT_TIMEOUT", 90000
         ), patch.object(tool_set.time, "perf_counter", return_value=12.5):
-            self.assertEqual(tool_set._screenshot_timeout_ms(10.0), 2500)
+            self.assertEqual(tool_set._remaining_timeout_ms(15.0, timeout_cap=90000), 2500)
 
-        with patch.object(tool_set, "GLOBAL_RUN_TIMEOUT", 5000), patch.object(
-            tool_set.time, "perf_counter", return_value=16.0
-        ):
-            with self.assertRaisesRegex(TimeoutError, "Global run deadline"):
-                tool_set._screenshot_timeout_ms(10.0)
+        with patch.object(tool_set.time, "perf_counter", return_value=16.0):
+            with self.assertRaisesRegex(TimeoutError, "Per-tab render deadline"):
+                tool_set._remaining_timeout_ms(15.0)
 
     def test_tab_discovery_is_hierarchical(self):
         markup = """
@@ -125,7 +126,8 @@ class WalkthroughTests(unittest.TestCase):
         <style>.tab-pane:not(.active) { display: none; }</style>
         <div id="computing">Computing ...</div>
                 <section id="panel" class="tab-pane active">
-                    <div class="shiny-bound-output recalculating" id="output">Starting</div>
+                        <div class="shiny-bound-output recalculating" id="output">Starting</div>
+                        <img id="delayed-plot" alt="Delayed plot" style="width: 1px; height: 1px">
                 </section>
         <script>
           document.documentElement.classList.add('shiny-busy');
@@ -134,6 +136,10 @@ class WalkthroughTests(unittest.TestCase):
             document.querySelector('#computing').remove();
             document.querySelector('#output').textContent = 'Rendered output';
           }, 1000);
+                    setTimeout(() => {
+                        document.querySelector('#delayed-plot').src =
+                            'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=';
+                    }, 1800);
         </script>
         """
         with sync_playwright() as playwright:
@@ -143,8 +149,9 @@ class WalkthroughTests(unittest.TestCase):
             started = time.perf_counter()
             tool_set._wait_for_tab_settle(page, timeout=5000, panel_id="panel")
             elapsed = time.perf_counter() - started
-            self.assertGreaterEqual(elapsed, 2.0)
+            self.assertGreaterEqual(elapsed, 3.0)
             self.assertEqual(page.locator("#output").inner_text(), "Rendered output")
+            self.assertEqual(page.locator("#delayed-plot").evaluate("el => el.naturalWidth"), 1)
             self.assertTrue(page.locator("#output").evaluate("el => el.classList.contains('recalculating')"))
             browser.close()
 
@@ -194,6 +201,9 @@ class WalkthroughTests(unittest.TestCase):
         ), patch.object(tool_set, "_visible_tab_descriptors", side_effect=[[first, second], [], []]), patch.object(
             tool_set, "_activate_tab"
         ), patch.object(tool_set, "_wait_for_tab_settle"), patch.object(
+            tool_set, "_shiny_connection_snapshot",
+            return_value={"status": "unknown", "disconnect_count": 0, "disconnected": False},
+        ), patch.object(
             tool_set, "_is_tab_panel_active", return_value=False
         ), patch.object(tool_set, "generate_test_report", side_effect=save_report):
             tool_set.run_comprehensive_shiny_tests("https://example.test", "Teal")
@@ -203,10 +213,75 @@ class WalkthroughTests(unittest.TestCase):
         self.assertEqual(rows[1]["screenshot_base64"], "c2Vjb25kLXBuZw==")
         browser.close.assert_called_once_with()
 
-    def test_timeout_defaults_are_finite_and_allow_60_seconds_for_render(self):
+    def test_capture_retries_after_a_disconnect_during_screenshot(self):
+        page = MagicMock()
+        page.screenshot.side_effect = [b"discarded-png", b"stable-png"]
+        snapshots = [
+            {"status": "connected", "disconnect_count": 0, "disconnected": False},
+            {"status": "disconnected", "disconnect_count": 1, "disconnected": True},
+            {"status": "connected", "disconnect_count": 1, "disconnected": False},
+            {"status": "connected", "disconnect_count": 1, "disconnected": False},
+        ]
+        events = []
+
+        def snapshot(_page):
+            events.append("connection-check")
+            return snapshots.pop(0)
+
+        def settle(_page, timeout, panel_id):
+            events.append("settled")
+
+        with patch.object(tool_set, "_shiny_connection_snapshot", side_effect=snapshot), patch.object(
+            tool_set, "_wait_for_tab_settle", side_effect=settle
+        ), patch.object(tool_set, "_remaining_timeout_ms", return_value=5000):
+            screenshot = tool_set._capture_tab_screenshot(page, "Matrix", "matrix-panel", 100.0)
+
+        self.assertEqual(screenshot, b"stable-png")
+        self.assertEqual(page.screenshot.call_count, 2)
+        self.assertEqual(events, [
+            "connection-check", "connection-check", "settled", "connection-check", "connection-check"
+        ])
+
+    def test_persistent_disconnect_prevents_screenshot(self):
+        page = MagicMock()
+        disconnected = {"status": "disconnected", "disconnect_count": 1, "disconnected": True}
+        with patch.object(tool_set, "_shiny_connection_snapshot", return_value=disconnected), patch.object(
+            tool_set, "_wait_for_tab_settle", side_effect=TimeoutError("Shiny server disconnected")
+        ), patch.object(tool_set, "_remaining_timeout_ms", return_value=5000):
+            with self.assertRaisesRegex(TimeoutError, "Shiny server disconnected"):
+                tool_set._capture_tab_screenshot(page, "Matrix", "matrix-panel", 100.0)
+        page.screenshot.assert_not_called()
+
+    def test_settle_waits_for_shiny_reconnection(self):
+        markup = '<section id="panel" class="tab-pane active"></section>'
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            tool_set._install_shiny_connection_monitor(page)
+            page.goto("data:text/html," + markup)
+            page.evaluate("""() => {
+                const handlers = {};
+                window.jQuery = () => ({
+                    on: (name, handler) => { handlers[name] = handler; }
+                });
+                window.jQuery.trigger = name => handlers[name]?.();
+            }""")
+            page.wait_for_function("() => window.__qcShinyConnection.jqueryAttached")
+            page.evaluate("""() => {
+                window.jQuery.trigger('shiny:disconnected');
+                setTimeout(() => window.jQuery.trigger('shiny:connected'), 400);
+            }""")
+            started = time.perf_counter()
+            tool_set._wait_for_tab_settle(page, timeout=4000, panel_id="panel")
+            self.assertGreaterEqual(time.perf_counter() - started, 1.8)
+            self.assertEqual(tool_set._shiny_connection_snapshot(page)["status"], "connected")
+            self.assertTrue(page.evaluate("() => window.__qcShinyConnection.jqueryAttached"))
+            browser.close()
+
+    def test_timeout_defaults_allow_90_seconds_for_each_tab_render_and_capture(self):
         self.assertEqual(tool_set.SHINY_LOAD_TIMEOUT, 90000)
         self.assertEqual(tool_set.SHINY_READY_TIMEOUT, 60000)
-        self.assertEqual(tool_set.TAB_RENDER_TIMEOUT, 60000)
+        self.assertEqual(tool_set.TAB_RENDER_TIMEOUT, 90000)
         self.assertEqual(tool_set.SCREENSHOT_TIMEOUT, 90000)
         self.assertGreater(tool_set.GLOBAL_RUN_TIMEOUT, tool_set.SHINY_LOAD_TIMEOUT)
 
@@ -216,6 +291,8 @@ class WalkthroughTests(unittest.TestCase):
             "status": "success",
             "url": "https://example.test",
             "timestamp": "2026-09-26T12:00:00",
+            "start_time": "2026-09-26T12:00:00",
+            "end_time": "2026-09-26T12:00:02.500000",
             "total_tabs": 1,
             "root_tabs": 1,
             "elapsed_seconds": 2.5,
@@ -237,6 +314,9 @@ class WalkthroughTests(unittest.TestCase):
         self.assertNotIn("Slider Testing Results", generated_html)
         self.assertNotIn("Radio Button Testing Results", generated_html)
         self.assertIn("SUCCESS", generated_html)
+        self.assertIn("<strong>Start Time:</strong>", generated_html)
+        self.assertIn("<strong>End Time:</strong>", generated_html)
+        self.assertIn("<strong>Total Time for Testing:</strong> 2.5 s", generated_html)
         self.assertIn("Elapsed (s)", generated_html)
         self.assertIn("Tab Screenshots", generated_html)
 

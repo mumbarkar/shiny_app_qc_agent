@@ -6,8 +6,9 @@ load_dotenv()
 
 # Test the comprehensive test suite
 # test_url = "https://gallery.shinyapps.io/006-tabsets/"
-test_url = "https://rinpharma.shinyapps.io/nest_exploratory_stable/"
-app_name = "Teal Exploratory App"
+# test_url = "https://rinpharma.shinyapps.io/nest_exploratory_stable/"
+test_url = "https://rinpharma.shinyapps.io/nest_early-dev_stable/"
+app_name = "Teal Early Devevelopment App"
 
 print("\n" + "="*60)
 print("Starting Comprehensive Shiny App QC Test")
