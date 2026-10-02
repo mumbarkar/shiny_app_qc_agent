@@ -4,10 +4,12 @@ Purpose: Automated testing agent for Shiny applications using smolagents and Pla
 """
 
 import os
+import base64
 from dotenv import load_dotenv
 from smolagents import CodeAgent, ToolCallingAgent, tool
 from playwright.sync_api import sync_playwright, Page, Browser
 import json
+import html
 from datetime import datetime
 from typing import List, Dict, Any
 import time
@@ -20,11 +22,321 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Constants
-SHINY_NAVIGATION_WAIT = 6000  # Wait for Shiny JS to stabilize
-SHINY_LOAD_TIMEOUT = 40000    # Max page load time
-INTERACTION_WAIT = 5000       # Wait after user interactions
-TAB_CLICK_TIMEOUT = 10000     # Timeout for tab click operations
+# Timeout ceilings (milliseconds). Defaults are configurable via environment
+# variables; the 90s initial-navigation default is provisional based on the log.
+def _timeout_setting(name: str, default: int) -> int:
+    try:
+        return max(1000, int(os.getenv(name, str(default))))
+    except ValueError:
+        logger.warning("Ignoring invalid %s; using %d ms", name, default)
+        return default
+
+
+SHINY_LOAD_TIMEOUT = _timeout_setting("SHINY_LOAD_TIMEOUT_MS", 90000)
+SHINY_READY_TIMEOUT = _timeout_setting("SHINY_READY_TIMEOUT_MS", 60000)
+TAB_RENDER_TIMEOUT = _timeout_setting("SHINY_TAB_RENDER_TIMEOUT_MS", 60000)
+SCREENSHOT_TIMEOUT = _timeout_setting("SHINY_SCREENSHOT_TIMEOUT_MS", 90000)
+TAB_CLICK_TIMEOUT = _timeout_setting("SHINY_ACTION_TIMEOUT_MS", 15000)
+GLOBAL_RUN_TIMEOUT = _timeout_setting("SHINY_RUN_TIMEOUT_MS", 900000)
+INTERACTION_WAIT = 5000  # Retained for legacy standalone tools.
+
+TAB_SELECTOR = '[role="tab"], a[data-toggle="tab"], [data-bs-toggle="tab"]'
+CONTROL_SELECTOR = 'button, input:not([type="hidden"]), select, textarea, [role="button"], [role="checkbox"], [role="radio"]'
+
+
+def _screenshot_timeout_ms(run_started: float) -> int:
+    remaining_ms = GLOBAL_RUN_TIMEOUT - int((time.perf_counter() - run_started) * 1000)
+    if remaining_ms <= 0:
+        raise TimeoutError("Global run deadline reached before screenshot capture")
+    return min(SCREENSHOT_TIMEOUT, remaining_ms)
+
+
+def _visible_tab_descriptors(page: Page, parent_panel: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """Find root tabs or only the immediate child tabs in a selected panel."""
+    return page.evaluate(
+        """({selector, parentPanel}) => {
+            const visible = el => {
+                const style = getComputedStyle(el);
+                return !!(el.getClientRects().length && style.visibility !== 'hidden' && style.display !== 'none');
+            };
+            const panelSelector = '.tab-pane, [role="tabpanel"]';
+            let parentScope = null;
+            if (parentPanel) {
+                const id = parentPanel.panel_id || '';
+                const href = parentPanel.href || '';
+                const controls = parentPanel.controls || '';
+                const panelId = controls || (href.startsWith('#') ? href.slice(1) : '');
+                parentScope = (id && document.getElementById(id)) ||
+                    (panelId && document.getElementById(panelId)) ||
+                    (parentPanel.id && document.getElementById(parentPanel.id)) ||
+                    [...document.querySelectorAll(`${panelSelector}.active, [role="tabpanel"]`)].filter(visible).at(-1) || document;
+            }
+            const seen = new Map();
+            return [...document.querySelectorAll(selector)].filter(el => {
+                if (!visible(el)) return false;
+                const href = el.getAttribute('href') || '';
+                const targetId = el.getAttribute('aria-controls') || (href.startsWith('#') ? href.slice(1) : '');
+                const targetPanel = targetId && document.getElementById(targetId);
+                const ownerPanel = targetPanel ? targetPanel.parentElement.closest(panelSelector) : el.closest(panelSelector);
+                return parentPanel ? ownerPanel === parentScope : ownerPanel === null;
+            }).map((el, index) => {
+                const text = (el.innerText || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ');
+                const descriptor = {
+                    index,
+                    text,
+                    id: el.id || '',
+                    href: el.getAttribute('href') || '',
+                    value: el.getAttribute('data-value') || '',
+                    controls: el.getAttribute('aria-controls') || '',
+                    panel_id: el.getAttribute('aria-controls') || ((el.getAttribute('href') || '').startsWith('#') ? (el.getAttribute('href') || '').slice(1) : ''),
+                    role: el.getAttribute('role') || '',
+                    selector: el.hasAttribute('data-bs-toggle') ? '[data-bs-toggle="tab"]' :
+                        (el.hasAttribute('data-toggle') ? 'a[data-toggle="tab"]' : '[role="tab"]')
+                };
+                const identity = descriptor.id || descriptor.href || descriptor.value || descriptor.controls;
+                const base = [identity, text, descriptor.role].join('|');
+                const occurrence = seen.get(base) || 0;
+                seen.set(base, occurrence + 1);
+                descriptor.key = `${base}|${occurrence}`;
+                return descriptor;
+            }).filter(tab => tab.text);
+        }""",
+        {"selector": TAB_SELECTOR, "parentPanel": parent_panel},
+    )
+
+
+def _visible_control_inventory(page: Page, tab: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Inspect visible control metadata and state without changing the app."""
+    return page.evaluate(
+        """({selector, tab}) => {
+            const visible = el => {
+                const style = getComputedStyle(el);
+                return !!(el.getClientRects().length && style.visibility !== 'hidden' && style.display !== 'none');
+            };
+            const panelId = tab && tab.panel_id;
+            const scope = (panelId && document.getElementById(panelId)) ||
+                [...document.querySelectorAll('.tab-pane.active, [role="tabpanel"]')].filter(visible).at(-1) || document;
+            const inCurrentPanel = el => scope === document || el.closest('.tab-pane, [role="tabpanel"]') === scope;
+            const controls = [...scope.querySelectorAll(selector)].filter(el => visible(el) && inCurrentPanel(el));
+            const counts = {};
+            const details = controls.map(el => {
+                const tag = el.tagName.toLowerCase();
+                const nativeType = (el.getAttribute('type') || tag).toLowerCase();
+                const type = el.closest('.shiny-input-slider, .irs') ? 'shiny-slider' : nativeType;
+                counts[type] = (counts[type] || 0) + 1;
+                const associatedLabel = el.labels && el.labels.length ? [...el.labels].map(label => label.innerText).join(' ') : '';
+                const safeValue = ['password', 'file'].includes(nativeType) ? null :
+                    (el.type === 'checkbox' || el.type === 'radio' ? null : (el.value ?? null));
+                return {
+                    tag,
+                    type,
+                    native_type: nativeType,
+                    id: el.id || null,
+                    name: el.getAttribute('name'),
+                    class: typeof el.className === 'string' ? el.className : '',
+                    label: (el.getAttribute('aria-label') || associatedLabel || el.getAttribute('placeholder') || el.innerText || '').trim().slice(0, 160),
+                    value_present: safeValue !== null && String(safeValue).length > 0,
+                    checked: (el.type === 'checkbox' || el.type === 'radio') ? !!el.checked : null,
+                    selected_option_count: el.tagName === 'SELECT' ? el.selectedOptions.length : null,
+                    disabled: !!el.disabled,
+                    required: !!el.required,
+                    valid: el.validity ? el.validity.valid : null,
+                    validation_message: el.validationMessage || ''
+                };
+            });
+            const outputs = {};
+            const outputSelectors = {
+                plots: '.shiny-plot-output, .plotly, .highcharts-container, canvas, svg',
+                tables: 'table, .dataTables_wrapper, .shiny-output-table',
+                downloads: 'a[download], .shiny-download-link',
+                shiny_outputs: '.shiny-bound-output'
+            };
+            for (const [name, selector] of Object.entries(outputSelectors)) {
+                outputs[name] = [...scope.querySelectorAll(selector)].filter(el => visible(el) && inCurrentPanel(el)).length;
+            }
+            const errors = [...scope.querySelectorAll('.shiny-output-error, .shiny-output-error-validation, .alert-danger')]
+                .filter(el => visible(el) && inCurrentPanel(el)).map(el => (el.innerText || '').trim()).filter(Boolean);
+            return {total: details.length, counts, controls: details, outputs, errors, panel_id: scope.id || null};
+        }""",
+        {"selector": CONTROL_SELECTOR, "tab": tab},
+    )
+
+
+def _wait_for_shiny_content(page: Page, timeout: int = SHINY_READY_TIMEOUT) -> None:
+    """Wait for a useful Shiny DOM without depending on network-idle (WebSockets)."""
+    page.locator('body').wait_for(state='attached', timeout=timeout)
+    page.wait_for_function(
+        """() => document.readyState !== 'loading' && (
+            document.body.innerText.trim().length > 0 ||
+            document.querySelectorAll('[role="tab"], a[data-toggle="tab"], [data-bs-toggle="tab"], .shiny-bound-input, input, select, button').length > 0
+        )""",
+        timeout=timeout,
+    )
+
+
+def _wait_for_root_tabs(page: Page, timeout: int = SHINY_READY_TIMEOUT) -> None:
+    """Wait for visible top-level tabs, returning as soon as Shiny renders them."""
+    page.wait_for_function(
+        """selector => {
+            const visible = el => {
+                const style = getComputedStyle(el);
+                return !!(el.getClientRects().length && style.visibility !== 'hidden' && style.display !== 'none');
+            };
+            const panelSelector = '.tab-pane, [role="tabpanel"]';
+            return [...document.querySelectorAll(selector)].some(el => {
+                if (!visible(el)) return false;
+                const href = el.getAttribute('href') || '';
+                const targetId = el.getAttribute('aria-controls') || (href.startsWith('#') ? href.slice(1) : '');
+                const targetPanel = targetId && document.getElementById(targetId);
+                const ownerPanel = targetPanel
+                    ? targetPanel.parentElement.closest(panelSelector)
+                    : el.closest(panelSelector);
+                return ownerPanel === null;
+            });
+        }""",
+        arg=TAB_SELECTOR,
+        timeout=timeout,
+    )
+
+
+def _wait_for_tab_settle(
+    page: Page,
+    timeout: int = TAB_RENDER_TIMEOUT,
+    panel_id: str | None = None,
+) -> None:
+    """Wait until the panel is active, Shiny is idle, and visible progress has ended."""
+    page.wait_for_function(
+        """expectedPanelId => {
+            const visible = el => {
+                const style = getComputedStyle(el);
+                return !!(el.getClientRects().length && style.visibility !== 'hidden' &&
+                    style.display !== 'none' && Number(style.opacity) > 0);
+            };
+            const panels = [...document.querySelectorAll('.tab-pane.active, [role="tabpanel"]')].filter(visible);
+            const expected = expectedPanelId && document.getElementById(expectedPanelId);
+            if (expected && (!visible(expected) || (!expected.classList.contains('active') && expected.getAttribute('aria-hidden') === 'true'))) return false;
+            const scope = expected || (panels.length ? panels[panels.length - 1] : document.body);
+            if (window.__qc_observed_panel !== scope) {
+                if (window.__qc_panel_observer) window.__qc_panel_observer.disconnect();
+                window.__qc_last_panel_mutation = performance.now();
+                window.__qc_observed_panel = scope;
+                window.__qc_panel_observer = new MutationObserver(() => {
+                    window.__qc_last_panel_mutation = performance.now();
+                });
+                window.__qc_panel_observer.observe(scope, {subtree: true, childList: true, attributes: true, characterData: true});
+            }
+
+            // Shiny signals app-level server work on <html>, not necessarily
+            // inside the selected tab panel. Do not block on the
+            // `.recalculating` output class alone: some apps leave it attached
+            // to static/hidden outputs after the visible UI is already idle.
+            const outputBusy = !!scope.querySelector(
+                '.shiny-bound-output.shiny-busy, [aria-busy="true"]'
+            );
+            const appBusy = document.documentElement.classList.contains('shiny-busy') ||
+                document.body.classList.contains('shiny-busy') || outputBusy;
+
+            // Shiny's progress UI is commonly rendered outside the tab panel.
+            // Also recognize the plain-text Computing... indicator used by
+            // apps/widgets that do not use Shiny's standard progress classes.
+            const progressSelectors = [
+                '#shiny-notification-panel .shiny-progress-notification',
+                '.shiny-progress.open',
+                '[role="progressbar"]',
+                '[aria-busy="true"]',
+                '.shinybusy', '.shinybusy-container', '.shinybusy-spinner'
+            ].join(', ');
+            const visibleProgress = [...document.querySelectorAll(progressSelectors)].some(visible);
+            const textWalker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            let textNode;
+            let computingText = false;
+            while ((textNode = textWalker.nextNode())) {
+                const text = (textNode.nodeValue || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+                if (visible(textNode.parentElement) && /^(computing|loading|please wait)(?:\\s*[.\\u2026]*)?$/.test(text)) {
+                    computingText = true;
+                    break;
+                }
+            }
+            const progressBusy = visibleProgress || computingText;
+            if (appBusy || progressBusy) {
+                window.__qc_last_busy_seen = performance.now();
+            }
+
+            return !appBusy && !progressBusy &&
+                performance.now() - Math.max(
+                    window.__qc_last_panel_mutation || 0,
+                    window.__qc_last_busy_seen || 0
+                ) >= 1200;
+        }""",
+        arg=panel_id,
+        timeout=timeout,
+    )
+
+
+def _activate_tab(page: Page, tab: Dict[str, Any]) -> None:
+    """Resolve and activate the intended visible tab from its stable DOM attributes."""
+    activated = page.evaluate(
+        """({selector, target}) => {
+            const visible = el => {
+                const style = getComputedStyle(el);
+                return !!(el.getClientRects().length && style.visibility !== 'hidden' && style.display !== 'none');
+            };
+            for (const el of document.querySelectorAll(selector)) {
+                if (!visible(el)) continue;
+                const text = (el.innerText || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ');
+                const matches = target.href
+                    ? (el.getAttribute('href') || '') === target.href
+                    : target.id
+                        ? el.id === target.id
+                        : target.controls
+                            ? el.getAttribute('aria-controls') === target.controls
+                            : target.value
+                                ? el.getAttribute('data-value') === target.value && text === target.text
+                                : text === target.text && (el.getAttribute('role') || '') === (target.role || '');
+                if (matches && text === target.text) {
+                    el.scrollIntoView({block: 'center', inline: 'nearest'});
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }""",
+        {"selector": TAB_SELECTOR, "target": tab},
+    )
+    if not activated:
+        raise LookupError(f"Tab {tab.get('text', 'Unknown')!r} ({tab.get('href') or tab.get('id') or tab.get('value')}) is not visible when activation was attempted")
+
+
+def _is_tab_panel_active(page: Page, tab: Dict[str, Any]) -> bool:
+    """Return whether a tab's content panel is currently visible and selected."""
+    panel_id = tab.get("panel_id")
+    if not panel_id:
+        return False
+    return bool(page.evaluate(
+        """panelId => {
+            const panel = document.getElementById(panelId);
+            if (!panel) return false;
+            const style = getComputedStyle(panel);
+            const visible = !!(panel.getClientRects().length && style.visibility !== 'hidden' && style.display !== 'none');
+            const selected = panel.classList.contains('active') || panel.getAttribute('aria-hidden') === 'false';
+            return visible && selected;
+        }""",
+        panel_id,
+    ))
+
+
+def _collect_visible_shiny_errors(page: Page, tab: Dict[str, Any] | None = None) -> List[str]:
+    return page.evaluate(
+        """({selector, panelId}) => {
+            const panel = (panelId && document.getElementById(panelId)) ||
+                [...document.querySelectorAll('.tab-pane.active, [role="tabpanel"]')].filter(el => el.getClientRects().length).at(-1) || document;
+            return [...panel.querySelectorAll(selector)].filter(el =>
+                el.getClientRects().length && (panel === document || el.closest('.tab-pane, [role="tabpanel"]') === panel)
+            )
+                .map(el => (el.innerText || '').trim()).filter(Boolean);
+        }""",
+        {"selector": '.shiny-output-error, .shiny-output-error-validation, .alert-danger', "panelId": (tab or {}).get("panel_id")},
+    )
 
 @tool
 def navigate_to_shiny_app(url: str) -> str:
@@ -45,7 +357,7 @@ def navigate_to_shiny_app(url: str) -> str:
             page = browser.new_page()
             
             page.goto(url, wait_until="domcontentloaded", timeout=SHINY_LOAD_TIMEOUT)
-            page.wait_for_timeout(SHINY_NAVIGATION_WAIT)
+            _wait_for_shiny_content(page)
             
             title = page.title()
             logger.info(f"✓ Successfully navigated to: {title}")
@@ -71,7 +383,7 @@ def find_all_tabs_and_sections(url: str) -> str:
             page = browser.new_page()
             
             page.goto(url, wait_until="domcontentloaded", timeout=SHINY_LOAD_TIMEOUT)
-            page.wait_for_timeout(SHINY_NAVIGATION_WAIT)
+            _wait_for_shiny_content(page)
             
             navigation_elements = {
                 "tabs": [],
@@ -279,7 +591,7 @@ def test_tabs_navigation(url: str) -> str:
             page = browser.new_page()
             
             page.goto(url, wait_until="domcontentloaded", timeout=SHINY_LOAD_TIMEOUT)
-            page.wait_for_timeout(SHINY_NAVIGATION_WAIT)
+            _wait_for_shiny_content(page)
             
             tab_results = {
                 "url": url,
@@ -421,7 +733,7 @@ def test_sliders(url: str) -> str:
             page = browser.new_page()
             
             page.goto(url, wait_until="domcontentloaded", timeout=SHINY_LOAD_TIMEOUT)
-            page.wait_for_timeout(SHINY_NAVIGATION_WAIT)
+            _wait_for_shiny_content(page)
             
             slider_results = {
                 "url": url,
@@ -589,7 +901,7 @@ def test_radio_buttons(url: str) -> str:
             page = browser.new_page()
             
             page.goto(url, wait_until="domcontentloaded", timeout=SHINY_LOAD_TIMEOUT)
-            page.wait_for_timeout(SHINY_NAVIGATION_WAIT)
+            _wait_for_shiny_content(page)
             
             radio_results = {
                 "url": url,
@@ -657,8 +969,8 @@ def test_radio_buttons(url: str) -> str:
 @tool
 def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
     """
-    Run comprehensive tests on a Shiny application and generate a detailed HTML report.
-    This orchestrates all testing phases: tabs, sliders, radio buttons, and page errors.
+    Walk every visible Shiny tab and generate an HTML report with an embedded screenshot per tab.
+    The smoke test only navigates tabs, waits for each panel to settle, and captures screenshots.
     
     Args:
         url: The URL of the Shiny app to test
@@ -672,74 +984,160 @@ def run_comprehensive_shiny_tests(url: str, app_name: str) -> str:
     logger.info(f"App: {app_name} | URL: {url}")
     logger.info(f"{'='*60}\n")
     
-    all_test_results = []
-    
+    run_started = time.perf_counter()
+    tab_results: Dict[str, Any] = {
+        "smoke_test": True,
+        "url": url,
+        "timestamp": datetime.now().isoformat(),
+        "tabs_tested": [],
+        "errors": [],
+        "total_tabs": 0,
+        "navigation_seconds": None,
+        "status": "success",
+    }
+    navigation_succeeded = False
+
+    logger.info("Launching one visible Chromium window for tab-walking smoke test...")
     try:
-        # Step 1: Discover all interactive elements
-        logger.info("\n[1/5] DISCOVERING INTERACTIVE ELEMENTS...")
-        discovery_result = find_all_tabs_and_sections(url)
-        discovery_data = json.loads(discovery_result)
-        logger.info(f"✓ Discovery complete: Found {len(discovery_data.get('tabs', []))} tabs, {len(discovery_data.get('sliders', []))} sliders")
-        
-        # Step 2: Test tab navigation
-        logger.info("\n[2/5] TESTING TAB NAVIGATION...")
-        try:
-            tabs_result = test_tabs_navigation(url)
-            tabs_data = json.loads(tabs_result)
-            all_test_results.append(tabs_data)
-            logger.info(f"✓ Tab testing complete: {len(tabs_data.get('tabs_tested', []))} tabs tested")
-        except Exception as e:
-            logger.error(f"✗ Tab testing failed: {str(e)}")
-            all_test_results.append({"tabs_tested": [], "errors": [str(e)]})
-        
-        # Step 3: Test sliders
-        logger.info("\n[3/5] TESTING SLIDERS...")
-        try:
-            sliders_result = test_sliders(url)
-            sliders_data = json.loads(sliders_result)
-            all_test_results.append(sliders_data)
-            logger.info(f"✓ Slider testing complete: {sliders_data.get('total_sliders', 0)} sliders found, {len(sliders_data.get('sliders_tested', []))} tested")
-        except Exception as e:
-            logger.error(f"✗ Slider testing failed: {str(e)}")
-            all_test_results.append({"sliders_tested": [], "errors": [str(e)], "total_sliders": 0})
-        
-        # Step 4: Test radio buttons
-        logger.info("\n[4/5] TESTING RADIO BUTTONS...")
-        try:
-            radio_result = test_radio_buttons(url)
-            radio_data = json.loads(radio_result)
-            all_test_results.append(radio_data)
-            logger.info(f"✓ Radio button testing complete: {len(radio_data.get('radio_buttons_tested', []))} tested")
-        except Exception as e:
-            logger.error(f"✗ Radio button testing failed: {str(e)}")
-            all_test_results.append({"radio_buttons_tested": [], "errors": [str(e)]})
-        
-        # Step 5: Test main page for errors
-        logger.info("\n[5/5] TESTING MAIN PAGE...")
-        try:
-            page_result = test_shiny_page(url, tab_name=None)
-            page_data = json.loads(page_result)
-            all_test_results.append(page_data)
-            logger.info(f"✓ Page testing complete: Status {page_data.get('status', 'unknown')}")
-        except Exception as e:
-            logger.error(f"✗ Page testing failed: {str(e)}")
-            all_test_results.append({"tab_tested": "Main", "status": "error", "errors": [str(e)]})
-        
-        # Step 6: Generate comprehensive report
-        logger.info("\n[6/6] GENERATING COMPREHENSIVE REPORT...")
-        results_json = json.dumps(all_test_results)
-        report_path = generate_test_report(results_json, app_name)
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"✓ COMPREHENSIVE TEST SUITE COMPLETED SUCCESSFULLY")
-        logger.info(f"Report: {report_path}")
-        logger.info(f"{'='*60}\n")
-        
-        return report_path
-        
-    except Exception as e:
-        logger.error(f"\n✗ COMPREHENSIVE TEST SUITE FAILED: {str(e)}")
-        logger.error(f"{'='*60}\n")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=False)
+            page = browser.new_page()
+            try:
+                navigation_started = time.perf_counter()
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=SHINY_LOAD_TIMEOUT)
+                    _wait_for_shiny_content(page)
+                    navigation_succeeded = True
+                except Exception as exc:
+                    tab_results["errors"].append(f"Initial navigation/readiness failed: {exc}")
+                    tab_results["status"] = "failed"
+                    logger.exception("Initial navigation/readiness failed")
+                finally:
+                    tab_results["navigation_seconds"] = round(time.perf_counter() - navigation_started, 2)
+                    logger.info("Initial navigation/readiness elapsed: %.2fs", tab_results["navigation_seconds"])
+
+                if not navigation_succeeded:
+                    report_path = generate_test_report(json.dumps([tab_results]), app_name)
+                    logger.error("Walkthrough failed during startup; failure report: %s", report_path)
+                    return report_path
+
+                logger.info("Discovering and walking visible tabs in the same page...")
+                try:
+                    _wait_for_root_tabs(page, timeout=SHINY_READY_TIMEOUT)
+                except Exception as exc:
+                    logger.warning("No visible root tabs appeared within %d ms: %s", SHINY_READY_TIMEOUT, exc)
+                    tab_results["warnings"] = [
+                        f"No visible root tabs appeared within {SHINY_READY_TIMEOUT / 1000:g} seconds: {exc}"
+                    ]
+                root_tabs = _visible_tab_descriptors(page)
+                known_work_items = set()
+                tab_results["root_tabs"] = len(root_tabs)
+                tab_results["total_tabs"] = 0
+                logger.info("Initially discovered %d root tab(s)", len(root_tabs))
+                if not root_tabs:
+                    tab_results["status"] = "warning"
+                    tab_results["warnings"] = ["No visible tabs were discovered."]
+
+                def walk_tab(tab: Dict[str, Any], ancestors: List[Dict[str, Any]]) -> None:
+                    ancestry = [*ancestors, tab]
+                    work_key = (tuple(item["key"] for item in ancestors), tab["key"])
+                    if work_key in known_work_items:
+                        return
+                    known_work_items.add(work_key)
+                    tab_results["total_tabs"] += 1
+                    tab_name = tab["text"]
+                    tab_started = time.perf_counter()
+                    remaining_ms = GLOBAL_RUN_TIMEOUT - int((time.perf_counter() - run_started) * 1000)
+                    if remaining_ms <= 0:
+                        message = f"Global run deadline ({GLOBAL_RUN_TIMEOUT} ms) reached before tab '{tab_name}' was visited."
+                        tab_results["errors"].append(message)
+                        tab_results["status"] = "failed"
+                        tab_results["tabs_tested"].append({
+                            "text": tab_name,
+                            "key": tab["key"],
+                            "parent_tabs": [ancestor["text"] for ancestor in ancestors],
+                            "status": "not_run",
+                            "errors": message,
+                        })
+                        return
+                    tab_timeout = min(TAB_RENDER_TIMEOUT, remaining_ms)
+                    logger.info("Starting tab %d: %s", tab_results["total_tabs"], tab_name)
+                    try:
+                        for ancestor in ancestors:
+                            if not _is_tab_panel_active(page, ancestor):
+                                _activate_tab(page, ancestor)
+                                _wait_for_tab_settle(page, timeout=tab_timeout, panel_id=ancestor.get("panel_id"))
+                        _activate_tab(page, tab)
+                        _wait_for_tab_settle(page, timeout=tab_timeout, panel_id=tab.get("panel_id"))
+                        tab_results["tabs_tested"].append({
+                            "text": tab_name,
+                            "key": tab["key"],
+                            "parent_tabs": [ancestor["text"] for ancestor in ancestors],
+                            "status": "success",
+                            "errors": None,
+                            "elapsed_seconds": round(time.perf_counter() - tab_started, 2),
+                        })
+                        logger.info("Tab '%s' settled (%.2fs)", tab_name, time.perf_counter() - tab_started)
+                    except Exception as exc:
+                        tab_results["tabs_tested"].append({
+                            "text": tab_name,
+                            "key": tab["key"],
+                            "parent_tabs": [ancestor["text"] for ancestor in ancestors],
+                            "status": "error",
+                            "errors": str(exc),
+                            "elapsed_seconds": round(time.perf_counter() - tab_started, 2),
+                        })
+                        tab_results["errors"].append(f"Error testing tab '{tab_name}': {exc}")
+                        tab_results["status"] = "failed"
+                        logger.warning("Tab '%s' walkthrough failed: %s", tab_name, exc)
+                        return
+
+                    # Screenshot capture is required for a successful smoke-test row,
+                    # but a capture failure must not stop the remaining tab walk.
+                    try:
+                        screenshot_timeout = _screenshot_timeout_ms(run_started)
+                        screenshot_bytes = page.screenshot(
+                            type="png", full_page=True, timeout=screenshot_timeout
+                        )
+                        tab_results["tabs_tested"][-1]["screenshot_base64"] = base64.b64encode(
+                            screenshot_bytes
+                        ).decode("ascii")
+                    except Exception as exc:
+                        row = tab_results["tabs_tested"][-1]
+                        row["status"] = "screenshot_failed"
+                        row["errors"] = f"Screenshot capture failed: {exc}"
+                        tab_results["errors"].append(f"Tab '{tab_name}' screenshot capture failed: {exc}")
+                        tab_results["status"] = "failed"
+                        logger.warning("Screenshot capture failed for tab '%s': %s", tab_name, exc)
+                    tab_results["tabs_tested"][-1]["elapsed_seconds"] = round(
+                        time.perf_counter() - tab_started, 2
+                    )
+
+                    # Discover only immediate children of the panel just completed.
+                    child_tabs = _visible_tab_descriptors(page, parent_panel=tab)
+                    for child_tab in child_tabs:
+                        child_key = (tuple(item["key"] for item in ancestry), child_tab["key"])
+                        if child_key not in known_work_items:
+                            walk_tab(child_tab, ancestry)
+
+                for root_tab in root_tabs:
+                    walk_tab(root_tab, [])
+
+                if tab_results["status"] == "success" and any(
+                    row.get("status") == "not_run" for row in tab_results["tabs_tested"]
+                ):
+                    tab_results["status"] = "failed"
+                tab_results["elapsed_seconds"] = round(time.perf_counter() - run_started, 2)
+
+                logger.info("Generating report; %d/%d tabs visited", len(tab_results["tabs_tested"]), tab_results["total_tabs"])
+                report_path = generate_test_report(json.dumps([tab_results]), app_name)
+                logger.info("Walkthrough elapsed: %.2fs", time.perf_counter() - run_started)
+                logger.info("✓ Comprehensive test suite completed. Report: %s", report_path)
+                return report_path
+            finally:
+                browser.close()
+    except Exception as exc:
+        logger.exception("Comprehensive Shiny test suite failed")
         raise
 
 def is_critical_error(error_text: str) -> bool:
@@ -775,7 +1173,7 @@ def test_shiny_page(url: str, tab_name: str = None) -> str:
             page.on("pageerror", lambda exc: errors.append(str(exc)))
             
             page.goto(url, wait_until="domcontentloaded", timeout=SHINY_LOAD_TIMEOUT)
-            page.wait_for_timeout(SHINY_NAVIGATION_WAIT)
+            _wait_for_shiny_content(page)
             
             test_results = {
                 "timestamp": datetime.now().isoformat(),
@@ -895,6 +1293,116 @@ def generate_test_report(test_results: str, app_name: str) -> str:
         else:
             # If it's a dict, treat it as main page results
             main_page_results = results_data
+
+        smoke_results = next(
+            (result for result in results_data if result.get("smoke_test")),
+            None,
+        ) if isinstance(results_data, list) else None
+        if smoke_results is not None:
+            tabs = smoke_results.get("tabs_tested", [])
+            tab_statuses = {tab.get("status") for tab in tabs}
+            if smoke_results.get("status") == "failed" or tab_statuses.intersection(
+                {"error", "screenshot_failed", "not_run"}
+            ):
+                overall_status = "failed"
+            elif smoke_results.get("status") == "warning":
+                overall_status = "warning"
+            else:
+                overall_status = "success"
+            overall_status_class = f"status-{overall_status}"
+            html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Tab-Walking Smoke Test - {html.escape(app_name)}</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{ margin: 0; padding: 28px; color: #172b4d; background: #f3f6fa; font-family: Segoe UI, Arial, sans-serif; }}
+        main {{ max-width: 1200px; margin: 0 auto; padding: 28px; background: white; border-radius: 14px; box-shadow: 0 10px 32px #19335418; }}
+        h1 {{ margin: 0 0 8px; }} h2 {{ margin-top: 32px; }}
+        .meta {{ color: #52647a; margin: 6px 0; }}
+        .status-success {{ color: #16834b; font-weight: 700; }} .status-warning {{ color: #a35e00; font-weight: 700; }} .status-failed {{ color: #b42318; font-weight: 700; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+        th, td {{ padding: 11px 12px; border-bottom: 1px solid #e5eaf0; text-align: left; vertical-align: top; }}
+        th {{ color: #344860; background: #f1f5f9; }}
+        .card {{ margin: 20px 0; padding: 18px; border: 1px solid #e1e8f0; border-radius: 10px; background: #fbfcfe; }}
+        .card img {{ display: block; width: 100%; height: auto; margin-top: 12px; border: 1px solid #d5deea; border-radius: 6px; }}
+        .error {{ color: #9f1d16; white-space: pre-wrap; }} .empty {{ color: #66788a; font-style: italic; }}
+        @media print {{ body {{ padding: 0; background: white; }} main {{ box-shadow: none; }} .card {{ break-inside: avoid; }} }}
+    </style>
+</head>
+<body>
+<main>
+    <h1>Tab-Walking Smoke Test</h1>
+    <p class="meta"><strong>App:</strong> {html.escape(app_name)}</p>
+    <p class="meta"><strong>URL:</strong> {html.escape(str(smoke_results.get('url') or 'Unavailable'))}</p>
+    <p class="meta"><strong>Test date:</strong> {html.escape(str(smoke_results.get('timestamp') or 'Unavailable'))}</p>
+    <p class="meta"><strong>Overall status:</strong> <span class="{overall_status_class}">{overall_status.upper()}</span></p>
+    <p class="meta"><strong>Tabs:</strong> {len(tabs)} visited of {smoke_results.get('total_tabs', len(tabs))} discovered; <strong>Root tabs:</strong> {smoke_results.get('root_tabs', 0)}</p>
+    <p class="meta"><strong>Elapsed:</strong> {html.escape(str(smoke_results.get('elapsed_seconds', '—')))} s; <strong>Initial navigation:</strong> {html.escape(str(smoke_results.get('navigation_seconds', '—')))} s</p>
+    <h2>Tab Walk Results</h2>
+    <table><thead><tr><th>Tab</th><th>Status</th><th>Elapsed (s)</th><th>Details</th></tr></thead><tbody>
+"""
+            if tabs:
+                for tab in tabs:
+                    tab_name = html.escape(str(tab.get("text") or "Unknown"))
+                    tab_status = str(tab.get("status") or "unknown")
+                    tab_status_class = "status-success" if tab_status == "success" else (
+                        "status-warning" if tab_status == "warning" else "status-failed"
+                    )
+                    parent_tabs = tab.get("parent_tabs", [])
+                    path = " / ".join(html.escape(str(name)) for name in [*parent_tabs, tab.get("text") or "Unknown"])
+                    details = html.escape(str(tab.get("errors") or "—"))
+                    html_content += (
+                        f"<tr><td>{path}</td><td><span class=\"{tab_status_class}\">{html.escape(tab_status.upper())}</span></td>"
+                        f"<td>{html.escape(str(tab.get('elapsed_seconds', '—')))}</td><td class=\"error\">{details}</td></tr>"
+                    )
+            else:
+                html_content += '<tr><td colspan="4" class="empty">No tabs were visited.</td></tr>'
+            html_content += "</tbody></table><h2>Tab Screenshots</h2>"
+            screenshots_added = 0
+            for tab in tabs:
+                image_data = tab.get("screenshot_base64")
+                tab_name = html.escape(str(tab.get("text") or "Unknown"))
+                if image_data:
+                    # The payload is generated by base64-encoding PNG bytes. Validate
+                    # before embedding so report input cannot introduce markup.
+                    try:
+                        base64.b64decode(image_data, validate=True)
+                    except (ValueError, TypeError):
+                        continue
+                    parent_tabs = tab.get("parent_tabs", [])
+                    path = " / ".join(html.escape(str(name)) for name in [*parent_tabs, tab.get("text") or "Unknown"])
+                    html_content += (
+                        f'<section class="card"><h3>{path}</h3>'
+                        f'<img src="data:image/png;base64,{image_data}" alt="Screenshot of {tab_name}"></section>'
+                    )
+                    screenshots_added += 1
+            if screenshots_added == 0:
+                html_content += '<p class="empty">No tab screenshots were captured.</p>'
+            for error in smoke_results.get("errors", []):
+                html_content += f'<p class="error">{html.escape(str(error))}</p>'
+            for warning in smoke_results.get("warnings", []):
+                html_content += f'<p class="meta">{html.escape(str(warning))}</p>'
+            html_content += "</main></body></html>"
+
+            with open(filename, "w", encoding="utf-8") as report_file:
+                report_file.write(html_content)
+            logger.info("✓ Tab-walking smoke report generated: %s", filename)
+            return f"Report generated: {filename}"
+
+        overall_status = "success"
+        if main_page_results and main_page_results.get("status") == "failed":
+            overall_status = "failed"
+        elif main_page_results and main_page_results.get("status") == "warning":
+            overall_status = "warning"
+        tab_statuses = {tab.get("status") for tab in (tabs_results or {}).get("tabs_tested", [])}
+        if tab_statuses.intersection({"error", "clicked_with_errors"}):
+            overall_status = "failed"
+        elif "warning" in tab_statuses and overall_status == "success":
+            overall_status = "warning"
+        status_class = {"success": "status-success", "warning": "status-warning", "failed": "status-failed"}[overall_status]
         
         # Build HTML content
         html_content = f"""
@@ -1031,7 +1539,7 @@ def generate_test_report(test_results: str, app_name: str) -> str:
                 <div class="header-info">
                     <div class="info-box">
                         <strong>App Name:</strong>
-                        <div class="metadata">{app_name}</div>
+                        <div class="metadata">{html.escape(app_name)}</div>
                     </div>
                     <div class="info-box">
                         <strong>Test Date:</strong>
@@ -1039,7 +1547,7 @@ def generate_test_report(test_results: str, app_name: str) -> str:
                     </div>
                     <div class="info-box">
                         <strong>Overall Status:</strong>
-                        <div class="metadata"><span class="status-success">✓ COMPLETED</span></div>
+                        <div class="metadata"><span class="{status_class}">{overall_status.upper()}</span></div>
                     </div>
                 </div>
         """
@@ -1054,6 +1562,8 @@ def generate_test_report(test_results: str, app_name: str) -> str:
                             <tr>
                                 <th>Tab Name</th>
                                 <th>Status</th>
+                                <th>Checklist</th>
+                                <th>Elapsed (s)</th>
                                 <th>Error Details</th>
                             </tr>
                         </thead>
@@ -1061,25 +1571,90 @@ def generate_test_report(test_results: str, app_name: str) -> str:
             """
             if tabs_results.get("tabs_tested"):
                 for tab in tabs_results["tabs_tested"]:
-                    status_class = "status-success" if tab.get("status") == "success" else "status-failed"
-                    status_icon = "✓" if tab.get("status") == "success" else "✗"
-                    errors = tab.get("errors") or "None"
+                    status_class = "status-success" if tab.get("status") == "success" else (
+                        "status-warning" if tab.get("status") in {"warning", "not_run"} else "status-failed"
+                    )
+                    status_icon = "✓" if tab.get("status") == "success" else ("⚠" if tab.get("status") in {"warning", "not_run"} else "✗")
+                    errors = html.escape(str(tab.get("errors") or "None"))
+                    if tab.get("warnings"):
+                        warnings = html.escape(" | ".join(tab["warnings"]))
+                        errors += f"<br><strong>Warnings:</strong> {warnings}"
                     html_content += f"""
                             <tr>
                                 <td><strong>{tab.get('text', 'Unknown')}</strong></td>
                                 <td><span class="{status_class}">{status_icon} {tab.get('status', 'unknown').upper()}</span></td>
+                                <td>{tab.get('checks_completed', 0)}/{tab.get('checks_total', 6)} checks</td>
+                                <td>{tab.get('elapsed_seconds', '—')}</td>
                                 <td>{errors}</td>
                             </tr>
                     """
             else:
-                html_content += '<tr><td colspan="3" class="no-data">No tab data available</td></tr>'
+                html_content += '<tr><td colspan="5" class="no-data">No tab data available</td></tr>'
             
             html_content += """
                         </tbody>
                     </table>
-                    <p class="metadata"><strong>Total Tabs Tested:</strong> {}</p>
+                    <p class="metadata"><strong>Discovered:</strong> {} &nbsp; <strong>Visited:</strong> {} &nbsp; <strong>Root tabs:</strong> {}</p>
                 </div>
-            """.format(len(tabs_results.get("tabs_tested", [])))
+            """.format(
+                tabs_results.get("total_tabs", len(tabs_results.get("tabs_tested", []))),
+                sum(tab.get("status") != "not_run" for tab in tabs_results.get("tabs_tested", [])),
+                tabs_results.get("root_tabs", "—"),
+            )
+
+            if tabs_results.get("controls_by_tab"):
+                html_content += """
+                <div class="section">
+                    <h2>🧭 Per-Tab Visible Control Inventory</h2>
+                    <p class="metadata">Controls were inspected in place; input values were not changed and buttons were not activated.</p>
+                    <table>
+                        <thead><tr><th>Tab</th><th>Visible Controls</th><th>Types</th><th>Outputs</th></tr></thead>
+                        <tbody>
+                """
+                for tab_inventory in tabs_results["controls_by_tab"]:
+                    types_summary = ", ".join(
+                        f"{html.escape(str(kind))}: {count}"
+                        for kind, count in tab_inventory.get("counts", {}).items()
+                    ) or "None"
+                    outputs_summary = ", ".join(
+                        f"{html.escape(str(kind))}: {count}"
+                        for kind, count in tab_inventory.get("outputs", {}).items()
+                    ) or "None"
+                    html_content += (
+                        f"<tr><td>{html.escape(str(tab_inventory.get('tab', 'Unknown')))}</td>"
+                        f"<td>{tab_inventory.get('total', 0)}</td>"
+                        f"<td>{types_summary}</td><td>{outputs_summary}</td></tr>"
+                    )
+                html_content += "</tbody></table></div>"
+                html_content += """
+                <div class="section">
+                    <h2>Visible Control Details</h2>
+                    <table>
+                        <thead><tr><th>Tab</th><th>Kind</th><th>Label</th><th>Element ID</th><th>State (redacted)</th></tr></thead>
+                        <tbody>
+                """
+                for tab_inventory in tabs_results["controls_by_tab"]:
+                    for control in tab_inventory.get("controls", []):
+                        label = html.escape(str(control.get("label") or ""))
+                        control_id = html.escape(str(control.get("id") or ""))
+                        states = ["Disabled" if control.get("disabled") else "Enabled"]
+                        if control.get("value_present") is not None:
+                            states.append("Value present" if control["value_present"] else "Empty")
+                        if control.get("checked") is not None:
+                            states.append("Checked" if control["checked"] else "Unchecked")
+                        if control.get("selected_option_count") is not None:
+                            states.append(f"{control['selected_option_count']} selected")
+                        if control.get("required"):
+                            states.append("Required")
+                        if control.get("valid") is False:
+                            states.append("Invalid")
+                        html_content += (
+                            f"<tr><td>{html.escape(str(tab_inventory.get('tab', 'Unknown')))}</td>"
+                            f"<td>{html.escape(str(control.get('type', 'unknown')))}</td>"
+                            f"<td>{label or '—'}</td><td>{control_id or '—'}</td>"
+                            f"<td>{html.escape(', '.join(states))}</td></tr>"
+                        )
+                html_content += "</tbody></table></div>"
         
         # Add sliders summary
         if sliders_results:
@@ -1101,8 +1676,8 @@ def generate_test_report(test_results: str, app_name: str) -> str:
             if sliders_results.get("sliders_tested"):
                 for slider in sliders_results["sliders_tested"]:
                     range_info = f"{slider.get('range', {}).get('min', 'N/A')} - {slider.get('range', {}).get('max', 'N/A')}"
-                    status_class = "status-success" if slider.get("status") == "tested" else "status-failed"
-                    status_icon = "✓" if slider.get("status") == "tested" else "✗"
+                    status_class = "status-success" if slider.get("status") in {"tested", "inspected"} else "status-failed"
+                    status_icon = "✓" if slider.get("status") in {"tested", "inspected"} else "✗"
                     html_content += f"""
                             <tr>
                                 <td><strong>{slider.get('id', 'Unknown')}</strong></td>
@@ -1141,9 +1716,9 @@ def generate_test_report(test_results: str, app_name: str) -> str:
             """
             if radio_results.get("radio_buttons_tested"):
                 for radio in radio_results["radio_buttons_tested"]:
-                    status_class = "status-success" if radio.get("status") == "tested" else "status-failed"
-                    status_icon = "✓" if radio.get("status") == "tested" else "✗"
-                    checked = "✓ Yes" if radio.get("was_checked") else "✗ No"
+                    status_class = "status-success" if radio.get("status") in {"tested", "inspected"} else "status-failed"
+                    status_icon = "✓" if radio.get("status") in {"tested", "inspected"} else "✗"
+                    checked = "Not changed" if radio.get("was_checked") is None else ("✓ Yes" if radio.get("was_checked") else "✗ No")
                     html_content += f"""
                             <tr>
                                 <td><strong>{radio.get('id', 'Unknown')}</strong></td>
@@ -1185,6 +1760,14 @@ def generate_test_report(test_results: str, app_name: str) -> str:
                             <tr>
                                 <td><strong>Tab Tested</strong></td>
                                 <td>{main_page_results.get('tab_tested', 'N/A')}</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Page Title</strong></td>
+                                <td>{html.escape(str(checks.get('page_title') or 'Unavailable'))}</td>
+                            </tr>
+                            <tr>
+                                <td><strong>HTTP Status</strong></td>
+                                <td>{html.escape(str(checks.get('http_status') or 'Unavailable'))}</td>
                             </tr>
                             <tr>
                                 <td><strong>Status</strong></td>

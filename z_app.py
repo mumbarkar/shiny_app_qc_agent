@@ -1,11 +1,13 @@
 from dotenv import load_dotenv
+import sys
 from tool_set import run_comprehensive_shiny_tests
 
 load_dotenv()
 
 # Test the comprehensive test suite
-test_url = "https://gallery.shinyapps.io/006-tabsets/"
-app_name = "006-tabsets"
+# test_url = "https://gallery.shinyapps.io/006-tabsets/"
+test_url = "https://rinpharma.shinyapps.io/nest_exploratory_stable/"
+app_name = "Teal Exploratory App"
 
 print("\n" + "="*60)
 print("Starting Comprehensive Shiny App QC Test")
@@ -18,3 +20,4 @@ except Exception as e:
     print(f"\n✗ ERROR: {str(e)}")
     import traceback
     traceback.print_exc()
+    sys.exit(1)
